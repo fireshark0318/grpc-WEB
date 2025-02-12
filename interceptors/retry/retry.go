@@ -40,14 +40,18 @@ func UnaryClientInterceptor(optFuncs ...CallOption) grpc.UnaryClientInterceptor 
 			if err := waitRetryBackoff(attempt, parentCtx, callOpts); err != nil {
 				return err
 			}
+			if attempt > 0 {
+				callOpts.onRetryCallback(parentCtx, attempt, lastErr)
+			}
 			callCtx, cancel := perCallContext(parentCtx, callOpts, attempt)
-			defer cancel() // Clean up potential resources.
 			lastErr = invoker(callCtx, method, req, reply, cc, grpcOpts...)
+			// Cancel the context immediately after invoking the next call in the chain to avoid
+			// holing onto its memory until this function returns.
+			cancel()
 			// TODO(mwitkow): Maybe dial and transport errors should be retriable?
 			if lastErr == nil {
 				return nil
 			}
-			callOpts.onRetryCallback(parentCtx, attempt, lastErr)
 			if isContextError(lastErr) {
 				if parentCtx.Err() != nil {
 					logTrace(parentCtx, "grpc_retry attempt: %d, parent context error: %v", attempt, parentCtx.Err())
@@ -94,20 +98,23 @@ func StreamClientInterceptor(optFuncs ...CallOption) grpc.StreamClientIntercepto
 			if err := waitRetryBackoff(attempt, parentCtx, callOpts); err != nil {
 				return nil, err
 			}
+			if attempt > 0 {
+				callOpts.onRetryCallback(parentCtx, attempt, lastErr)
+			}
 			var newStreamer grpc.ClientStream
-			newStreamer, lastErr = streamer(parentCtx, desc, cc, method, grpcOpts...)
+			newStreamer, lastErr = streamer(perStreamContext(parentCtx, callOpts, attempt), desc, cc, method, grpcOpts...)
 			if lastErr == nil {
 				retryingStreamer := &serverStreamingRetryingStream{
 					ClientStream: newStreamer,
 					callOpts:     callOpts,
 					parentCtx:    parentCtx,
 					streamerCall: func(ctx context.Context) (grpc.ClientStream, error) {
-						return streamer(ctx, desc, cc, method, grpcOpts...)
+						attempt++
+						return streamer(perStreamContext(ctx, callOpts, attempt), desc, cc, method, grpcOpts...)
 					},
 				}
 				return retryingStreamer, nil
 			}
-			callOpts.onRetryCallback(parentCtx, attempt, lastErr)
 			if isContextError(lastErr) {
 				if parentCtx.Err() != nil {
 					logTrace(parentCtx, "grpc_retry attempt: %d, parent context error: %v", attempt, parentCtx.Err())
@@ -267,15 +274,8 @@ func waitRetryBackoff(attempt uint, parentCtx context.Context, callOpts *options
 }
 
 func isRetriable(err error, callOpts *options) bool {
-	errCode := status.Code(err)
-	if isContextError(err) {
-		// context errors are not retriable based on user settings.
-		return false
-	}
-	for _, code := range callOpts.codes {
-		if code == errCode {
-			return true
-		}
+	if callOpts.retriableFunc != nil {
+		return callOpts.retriableFunc(err)
 	}
 	return false
 }
@@ -297,6 +297,15 @@ func perCallContext(parentCtx context.Context, callOpts *options, attempt uint) 
 		ctx = mdClone.ToOutgoing(ctx)
 	}
 	return ctx, cancel
+}
+
+func perStreamContext(parentCtx context.Context, callOpts *options, attempt uint) context.Context {
+	ctx := parentCtx
+	if attempt > 0 && callOpts.includeHeader {
+		mdClone := metadata.ExtractOutgoing(ctx).Clone().Set(AttemptMetadataKey, fmt.Sprintf("%d", attempt))
+		ctx = mdClone.ToOutgoing(ctx)
+	}
+	return ctx
 }
 
 func contextErrToGrpcErr(err error) error {
