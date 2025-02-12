@@ -6,6 +6,8 @@ package retry
 import (
 	"context"
 	"io"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -16,6 +18,7 @@ import (
 	"github.com/stretchr/testify/suite"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 )
 
@@ -178,6 +181,16 @@ func (s *RetrySuite) TestUnary_OverrideFromDialOpts() {
 	require.EqualValues(s.T(), 5, s.srv.requestCount(), "five requests should have been made")
 }
 
+func (s *RetrySuite) TestUnary_OverrideFromDialOpts2() {
+	s.srv.resetFailingConfiguration(5, codes.ResourceExhausted, noSleep) // default is 3 and retriable_errors
+	out, err := s.Client.Ping(s.SimpleCtx(), testpb.GoodPing, WithRetriable(func(err error) bool {
+		return strings.Contains(err.Error(), "maybeFailRequest")
+	}), WithMax(5))
+	require.NoError(s.T(), err, "the fifth invocation should succeed")
+	require.NotNil(s.T(), out, "Pong must be not nil")
+	require.EqualValues(s.T(), 5, s.srv.requestCount(), "five requests should have been made")
+}
+
 func (s *RetrySuite) TestUnary_OnRetryCallbackCalled() {
 	retryCallbackCount := 0
 
@@ -193,6 +206,21 @@ func (s *RetrySuite) TestUnary_OnRetryCallbackCalled() {
 	require.EqualValues(s.T(), 2, retryCallbackCount, "two retry callbacks should be called")
 }
 
+func (s *RetrySuite) TestUnary_OnRetryCallbackNotCalledOnNonRetriableError() {
+	retryCallbackCount := 0
+
+	s.srv.resetFailingConfiguration(3, codes.Internal, noSleep) // see retriable_errors
+	out, err := s.Client.Ping(s.SimpleCtx(), testpb.GoodPing,
+		WithOnRetryCallback(func(ctx context.Context, attempt uint, err error) {
+			retryCallbackCount++
+		}),
+	)
+
+	require.Error(s.T(), err, "should result in an error")
+	require.Nil(s.T(), out, "out should be nil")
+	require.EqualValues(s.T(), 0, retryCallbackCount, "no retry callbacks should be called")
+}
+
 func (s *RetrySuite) TestServerStream_SucceedsOnRetriableError() {
 	s.srv.resetFailingConfiguration(3, codes.DataLoss, noSleep) // see retriable_errors
 	stream, err := s.Client.PingList(s.SimpleCtx(), testpb.GoodPingList)
@@ -204,6 +232,16 @@ func (s *RetrySuite) TestServerStream_SucceedsOnRetriableError() {
 func (s *RetrySuite) TestServerStream_OverrideFromContext() {
 	s.srv.resetFailingConfiguration(5, codes.ResourceExhausted, noSleep) // default is 3 and retriable_errors
 	stream, err := s.Client.PingList(s.SimpleCtx(), testpb.GoodPingList, WithCodes(codes.ResourceExhausted), WithMax(5))
+	require.NoError(s.T(), err, "establishing the connection must always succeed")
+	s.assertPingListWasCorrect(stream)
+	require.EqualValues(s.T(), 5, s.srv.requestCount(), "three requests should have been made")
+}
+
+func (s *RetrySuite) TestServerStream_OverrideFromContext2() {
+	s.srv.resetFailingConfiguration(5, codes.ResourceExhausted, noSleep) // default is 3 and retriable_errors
+	stream, err := s.Client.PingList(s.SimpleCtx(), testpb.GoodPingList, WithRetriable(func(err error) bool {
+		return strings.Contains(err.Error(), "maybeFailRequest")
+	}), WithMax(5))
 	require.NoError(s.T(), err, "establishing the connection must always succeed")
 	s.assertPingListWasCorrect(stream)
 	require.EqualValues(s.T(), 5, s.srv.requestCount(), "three requests should have been made")
@@ -395,4 +433,74 @@ func TestJitterUp(t *testing.T) {
 
 	assert.True(t, highCount != 0, "at least one sample should reach to >%s", high)
 	assert.True(t, lowCount != 0, "at least one sample should to <%s", low)
+}
+
+type failingClientStream struct {
+	RecvMsgErr error
+}
+
+func (s *failingClientStream) Header() (metadata.MD, error) {
+	return nil, nil
+}
+
+func (s *failingClientStream) Trailer() metadata.MD {
+	return nil
+}
+
+func (s *failingClientStream) CloseSend() error {
+	return nil
+}
+
+func (s *failingClientStream) Context() context.Context {
+	return context.Background()
+}
+
+func (s *failingClientStream) SendMsg(m any) error {
+	return nil
+}
+
+func (s *failingClientStream) RecvMsg(m any) error {
+	return s.RecvMsgErr
+}
+
+func TestStreamClientInterceptorAttemptMetadata(t *testing.T) {
+	retryCount := 5
+	attempt := 0
+	recvMsgErr := status.Error(codes.Unavailable, "unavailable")
+
+	var testStreamer grpc.Streamer = func(
+		ctx context.Context,
+		desc *grpc.StreamDesc,
+		cc *grpc.ClientConn,
+		method string,
+		opts ...grpc.CallOption,
+	) (grpc.ClientStream, error) {
+		if attempt > 0 {
+			md, ok := metadata.FromOutgoingContext(ctx)
+			require.True(t, ok)
+
+			raw := md.Get(AttemptMetadataKey)
+			require.Len(t, raw, 1)
+
+			attemptMetadataValue, err := strconv.Atoi(raw[0])
+			require.NoError(t, err)
+
+			require.Equal(t, attempt, attemptMetadataValue)
+		}
+
+		attempt++
+
+		return &failingClientStream{
+			RecvMsgErr: recvMsgErr,
+		}, nil
+	}
+
+	streamClientInterceptor := StreamClientInterceptor(WithCodes(codes.Unavailable), WithMax(uint(retryCount)))
+	clientStream, err := streamClientInterceptor(context.Background(), &grpc.StreamDesc{}, nil, "some_method", testStreamer)
+	require.NoError(t, err)
+
+	err = clientStream.RecvMsg(nil)
+	require.ErrorIs(t, err, recvMsgErr)
+
+	require.Equal(t, retryCount, attempt)
 }
