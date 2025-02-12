@@ -20,27 +20,36 @@ const (
 	ListResponseCount = 100
 )
 
-var TestServiceFullName = _TestService_serviceDesc.ServiceName
+var TestServiceFullName = TestService_ServiceDesc.ServiceName
 
 // Interface implementation assert.
 var _ TestServiceServer = &TestPingService{}
 
 type TestPingService struct {
 	UnimplementedTestServiceServer
+	PingFunc func(ctx context.Context)
 }
 
 func (s *TestPingService) PingEmpty(_ context.Context, _ *PingEmptyRequest) (*PingEmptyResponse, error) {
 	return &PingEmptyResponse{}, nil
 }
 
-func (s *TestPingService) Ping(_ context.Context, ping *PingRequest) (*PingResponse, error) {
+func (s *TestPingService) Ping(ctx context.Context, ping *PingRequest) (*PingResponse, error) {
+	if s.PingFunc != nil {
+		s.PingFunc(ctx)
+	}
+	// Modify the ctx value to verify the logger sees the value updated from the initial value
+	n := ExtractCtxTestNumber(ctx)
+	if n != nil {
+		*n = 42
+	}
 	// Send user trailers and headers.
 	return &PingResponse{Value: ping.Value, Counter: 0}, nil
 }
 
 func (s *TestPingService) PingError(_ context.Context, ping *PingErrorRequest) (*PingErrorResponse, error) {
 	code := codes.Code(ping.ErrorCodeReturned)
-	return nil, status.Error(code, "Userspace error")
+	return nil, WrapFieldsInError(status.Error(code, "Userspace error"), []any{"error-field", "plop"})
 }
 
 func (s *TestPingService) PingList(ping *PingListRequest, stream TestService_PingListServer) error {
@@ -74,4 +83,19 @@ func (s *TestPingService) PingStream(stream TestService_PingStreamServer) error 
 		count += 1
 	}
 	return nil
+}
+
+func (s *TestPingService) PingClientStream(stream TestService_PingClientStreamServer) error {
+	count := 0
+	for {
+		_, err := stream.Recv()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		count += 1
+	}
+	return stream.SendAndClose(&PingClientStreamResponse{Counter: int32(count)})
 }
